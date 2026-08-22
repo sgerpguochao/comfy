@@ -1,54 +1,61 @@
 #!/bin/bash
-# MiniMax-H3 视频生成服务启动脚本（双 GPU，tmux 常驻）
-# 用法: ./start_services.sh start | stop | status | attach
+# MiniMax-H3 视频生成服务启动脚本（双 GPU，统一走 PM2）
+# 用法: ./start_services.sh start | stop | restart | status | logs
 #
-# 每张 GPU 跑一个 ComfyUI worker（--cuda-device 隔离），API 服务按队列长度
-# 把任务分发给最空闲的 GPU。进程跑在 tmux 会话中，不受终端退出影响。
-# --fast autotune cublas_ops: 启用 cuDNN benchmark 与 cuBLAS，加速推理。
+# 由 PM2 托管三个进程：
+#   - comfy-gpu0    (ComfyUI worker, GPU 0, 端口 8188)
+#   - comfy-gpu1    (ComfyUI worker, GPU 1, 端口 8189，独立 output/user/db 目录)
+#   - minimax-h3-api (FastAPI 调度层，端口 8000，含启动预热 + 后台 mux)
+#
+# 实际配置见 ecosystem.config.cjs；本脚本只是 PM2 的便捷包装。
 
-COMFY_DIR=/home/ubuntu/minmax/comfy/ComfyUI
-VENV=/home/ubuntu/minmax/comfy/venv/bin/python
-API=/home/ubuntu/minmax/comfy/api_server.py
-LOG_DIR=/home/ubuntu/minmax/comfy/logs
-SESSION=comfy-multi
+ECOSYSTEM=/home/ubuntu/comfy/ecosystem.config.cjs
 API_PORT=8000
-W0_PORT=8188
-W1_PORT=8189
-# worker 1 使用独立输出/用户/数据库目录，避免两实例的文件计数器与 comfyui.db 冲突
-OUT_DIR=/home/ubuntu/minmax/comfy/ComfyUI/output
-USER_DIR=/home/ubuntu/minmax/comfy/ComfyUI/user
-FAST="--fast autotune cublas_ops"
 
 start() {
-    mkdir -p "$LOG_DIR" "$USER_DIR/gpu1"
-    tmux kill-session -t "$SESSION" 2>/dev/null
-    tmux new-session -d -s "$SESSION" -x 220 -y 50
-    # worker 0 (GPU 0)
-    tmux send-keys -t "$SESSION:0" \
-        "env -u LD_LIBRARY_PATH $VENV $COMFY_DIR/main.py --listen 0.0.0.0 --port $W0_PORT --cuda-device 0 $FAST 2>&1 | tee $LOG_DIR/comfy_gpu0.log" Enter
-    # worker 1 (GPU 1)
-    tmux new-window -t "$SESSION" \
-        "env -u LD_LIBRARY_PATH $VENV $COMFY_DIR/main.py --listen 0.0.0.0 --port $W1_PORT --cuda-device 1 --output-directory $OUT_DIR/gpu1 --user-directory $USER_DIR/gpu1 --database-url sqlite:////home/ubuntu/minmax/comfy/ComfyUI/user/gpu1/comfyui.db $FAST 2>&1 | tee $LOG_DIR/comfy_gpu1.log"
-    # API
-    tmux new-window -t "$SESSION" \
-        "env -u LD_LIBRARY_PATH COMFY_HOSTS=127.0.0.1:$W0_PORT,127.0.0.1:$W1_PORT $VENV $API 2>&1 | tee $LOG_DIR/api.log"
+    if ! command -v pm2 >/dev/null 2>&1; then
+        echo "ERR: pm2 not installed, run: npm install -g pm2"
+        exit 1
+    fi
+    if [ ! -f "$ECOSYSTEM" ]; then
+        echo "ERR: ecosystem config not found: $ECOSYSTEM"
+        exit 1
+    fi
+    echo "[start] pm2 start $ECOSYSTEM ..."
+    pm2 start "$ECOSYSTEM"
     sleep 3
     status
 }
 
 stop() {
-    tmux kill-session -t "$SESSION" 2>/dev/null
-    echo "stopped"
+    # 复用 stop_services.sh 的逻辑（PM2 + tmux 兜底）
+    bash /home/ubuntu/comfy/stop_services.sh
+}
+
+restart() {
+    echo "[restart] stop then start ..."
+    stop
+    sleep 2
+    start
 }
 
 status() {
-    curl -s http://127.0.0.1:$API_PORT/health && echo
+    echo "--- pm2 ---"
+    pm2 list 2>/dev/null | grep -E 'comfy-gpu|minimax-h3' || echo "  no matching apps"
+    echo "--- /health ---"
+    curl -s -m 5 "http://127.0.0.1:$API_PORT/health" && echo
+}
+
+logs() {
+    # 用法: ./start_services.sh logs [app_name]
+    pm2 logs "${1:-}" --lines 80 --nostream 2>/dev/null || pm2 logs --lines 80 --nostream
 }
 
 case "$1" in
-    start) start ;;
-    stop) stop ;;
-    status) status ;;
-    attach) tmux attach -t "$SESSION" ;;
-    *) echo "usage: $0 start|stop|status|attach" ;;
+    start)   start ;;
+    stop)    stop ;;
+    restart) restart ;;
+    status)  status ;;
+    logs)    shift; logs "$@" ;;
+    *) echo "usage: $0 start|stop|restart|status|logs [app_name]" ;;
 esac

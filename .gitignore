@@ -40,6 +40,11 @@ id_ed25519*
 .DS_Store
 Thumbs.db
 
+# ---- Runtime state / backups ----
+api_state.json
+*.bak.*
+*.bak
+
 # ---- Crash dumps ----
 core.*
 *.core

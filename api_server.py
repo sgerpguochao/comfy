@@ -245,6 +245,14 @@ _task_bgm = {}        # task_id -> (BGM 引用, 音量)
 _muxed = {}           # 混流后文件名 -> 本地路径
 _vo_done = set()      # 已尝试后处理的 task_id（成功或失败都不再重试）
 
+# 启动预热：异步提交 1 个 dummy 任务把模型加载到显存，避免业务任务摊 7.5 分钟冷启
+_warmed_workers: set = set()       # 已完成 warmup 的 worker 索引
+_warmup_tasks: dict = {}           # worker 索引 -> asyncio.Task（用于状态查询/防重入）
+
+# 后处理后台队列：避免 mux 阻塞 /api/v1/task 轮询响应
+_post_queue: asyncio.Queue = None   # 启动时初始化
+_post_workers: list = []            # 后台 mux 处理协程列表
+
 
 def _save_state():
     """把任务元数据写入磁盘，服务重启后可恢复，避免口播等后处理静默丢失。"""
@@ -290,10 +298,66 @@ def _worker_url(i: int) -> str:
 
 @app.on_event("startup")
 async def startup():
-    global _workers, _local_load
+    global _workers, _local_load, _post_queue
     _workers = [aiohttp.ClientSession() for _ in COMFY_WORKERS]
     _local_load = [0] * len(COMFY_WORKERS)  # 并发调度：每个 worker 的"已预留"计数
     _load_state()  # 恢复任务元数据（口播/静音/worker 分配），防止重启丢失
+
+    # 后处理后台队列：把 mux 从 /api/v1/task 轮询链路剥离，避免阻塞客户端轮询
+    import asyncio as _aio
+    _post_queue = _aio.Queue()
+    # CPU 端 mux 开 2 个 worker 足够（ffmpeg + edge-tts 各占 CPU 不重）
+    for _ in range(2):
+        _post_workers.append(_aio.create_task(_mux_worker_loop()))
+
+    # 启动预热：后台异步加载模型，不阻塞 /health
+    _aio.create_task(_warmup_all_workers())
+
+
+async def _warmup_all_workers():
+    """给每张卡并发提交 1 个 dummy 任务，把 H3 模型加载到显存。
+
+    不阻塞 startup：_warmed_workers 在 /health 中反映 warm 状态，
+    客户端/测试脚本可以据此判断"可以提交业务任务"。
+    """
+    import asyncio as _aio
+    tasks = [_aio.create_task(_warmup_one(i)) for i in range(len(COMFY_WORKERS))]
+    await _aio.gather(*tasks, return_exceptions=True)
+
+
+async def _warmup_one(idx: int):
+    """单卡 warmup：提交 1 帧 1 step 的最小任务，触发 UNet/CLIP/VAE 加载。"""
+    if idx in _warmed_workers:
+        return
+    _warmup_tasks[idx] = _warmup_one  # 占位，避免重复触发
+    session, base = _workers[idx], _worker_url(idx)
+    try:
+        graph = build_prompt(
+            prompt="warmup", width=128, height=128,
+            duration=1, seed=0, steps=1,
+            first_frame=None, last_frame=None, prefix="warmup")
+        async with session.post(f"{base}/prompt",
+            json={"prompt": graph, "client_id": "warmup"}) as r:
+            await r.read()
+        _warmed_workers.add(idx)
+        print(f"[warmup] worker{idx} 模型已加载", flush=True)
+    except Exception as e:
+        print(f"[warmup] worker{idx} 失败: {e}", flush=True)
+    finally:
+        _warmup_tasks.pop(idx, None)
+
+
+async def _mux_worker_loop():
+    """后台消费 _post_queue，调用 _post_process；与 /task 轮询完全解耦。"""
+    while True:
+        item = await _post_queue.get()
+        try:
+            task_id, idx, src_fn, subfolder = item
+            await _post_process(task_id, idx, src_fn, subfolder)
+        except Exception as e:
+            print(f"[mux-bg] task={item[0] if item else '?'} 失败: {e}", flush=True)
+        finally:
+            _post_queue.task_done()
 
 
 @app.on_event("shutdown")
@@ -695,10 +759,22 @@ async def health():
     for i in range(len(COMFY_WORKERS)):
         try:
             async with _workers[i].get(f"{_worker_url(i)}/system_stats") as resp:
-                states.append({"worker": i, "url": _worker_url(i), "ok": resp.status == 200})
+                ok = resp.status == 200
         except Exception:
-            states.append({"worker": i, "url": _worker_url(i), "ok": False})
-    return {"status": "ok" if all(s["ok"] for s in states) else "degraded", "workers": states}
+            ok = False
+        states.append({
+            "worker": i, "url": _worker_url(i), "ok": ok,
+            "warmed": i in _warmed_workers,
+        })
+    all_ok = all(s["ok"] for s in states)
+    all_warm = all(s["warmed"] for s in states)
+    if not all_ok:
+        status = "degraded"
+    elif all_warm:
+        status = "ok"
+    else:
+        status = "warming"
+    return {"status": status, "workers": states}
 
 
 @app.get("/api/v1/video/{filename}")
@@ -766,10 +842,17 @@ async def task_status(task_id: str, request: Request):
         result["videos"] = []
         first = video_files[0]
         _video_worker[first.get("filename")] = idx
-        # 后处理（口播混流 / 静音）：任务完成后只对第一个视频处理一次
-        mux_name = await _post_process(task_id, idx,
-                                       first.get("filename"),
-                                       first.get("subfolder", ""))
+        # 后处理（口播混流 / 静音）：入后台队列，不阻塞 /task 轮询返回
+        # 客户端再次轮询时会通过 _post_done 检测是否完成
+        if _post_queue is not None:
+            _post_queue.put_nowait((task_id, idx,
+                                    first.get("filename"),
+                                    first.get("subfolder", "")))
+            mux_name = None  # 后台处理中
+        else:
+            mux_name = await _post_process(task_id, idx,
+                                           first.get("filename"),
+                                           first.get("subfolder", ""))
         first_url = f"{base}/api/v1/video/{mux_name or first['filename']}"
         # 未混流时带 subfolder，否则代理按输出根目录查找会 404（如 gpu1 的 video/ 子目录）
         if not mux_name and first.get("subfolder"):
@@ -950,10 +1033,16 @@ async def openai_video_status(task_id: str, request: Request):
             data = []
             first = video_files[0]
             _video_worker[first.get("filename")] = idx
-            # 后处理（口播混流 / 静音）：任务完成后只对第一个视频处理一次
-            mux_name = await _post_process(task_id, idx,
-                                           first.get("filename"),
-                                           first.get("subfolder", ""))
+            # 后处理（口播混流 / 静音）：入后台队列，不阻塞 /task 轮询返回
+            if _post_queue is not None:
+                _post_queue.put_nowait((task_id, idx,
+                                        first.get("filename"),
+                                        first.get("subfolder", "")))
+                mux_name = None
+            else:
+                mux_name = await _post_process(task_id, idx,
+                                               first.get("filename"),
+                                               first.get("subfolder", ""))
             first_url = f"{base}/api/v1/video/{mux_name or first['filename']}"
             if not mux_name and first.get("subfolder"):
                 first_url += f"?subfolder={first['subfolder']}"

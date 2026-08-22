@@ -5,7 +5,7 @@
 看 6 个 case 同时跑、worker 分配、整体吞吐。
 
 用法：
-  python3 bench_6cases_concurrent.py --api http://162.14.110.145:8000
+  python3 bench_6cases_concurrent.py --api http://127.0.0.1:8000
   python3 bench_6cases_concurrent.py --api http://127.0.0.1:8000 --download
 """
 import argparse

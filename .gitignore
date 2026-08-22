@@ -45,6 +45,11 @@ api_state.json
 *.bak.*
 *.bak
 
+# ---- Runtime video artifacts (generated outputs / muxed temp files) ----
+output/
+muxed/
+tts/
+
 # ---- Crash dumps ----
 core.*
 *.core

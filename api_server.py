@@ -243,7 +243,9 @@ _task_voiceover = {}  # task_id -> (口播文案, 音色)
 _task_noaudio = set() # task_id -> 静音（剥掉原声）
 _task_bgm = {}        # task_id -> (BGM 引用, 音量)
 _muxed = {}           # 混流后文件名 -> 本地路径
-_vo_done = set()      # 已尝试后处理的 task_id（成功或失败都不再重试）
+_vo_done = set()      # 后处理已终结的 task_id（成功或 ffmpeg 失败；源文件缺失不记入）
+_post_enqueued = set()  # 已入后台队列、避免每次轮询重复 put
+_post_failed = set()    # ffmpeg 已失败，不再重试
 
 # 启动预热：异步提交 1 个 dummy 任务把模型加载到显存，避免业务任务摊 7.5 分钟冷启
 _warmed_workers: set = set()       # 已完成 warmup 的 worker 索引
@@ -271,12 +273,22 @@ def _save_state():
         pass
 
 
+def _index_muxed_dir():
+    """把 muxed/ 里已有的 muted_/muxed_ 文件登记进 _muxed，重启后查询仍能命中。"""
+    if not os.path.isdir(MUX_DIR):
+        return
+    for fn in os.listdir(MUX_DIR):
+        if fn.startswith(("muted_", "muxed_")) and fn.endswith(".mp4"):
+            _muxed[fn] = os.path.join(MUX_DIR, fn)
+
+
 def _load_state():
     """启动时从磁盘恢复任务元数据。"""
     try:
         with open(STATE_FILE) as f:
             st = json.load(f)
     except (OSError, ValueError):
+        _index_muxed_dir()
         return
     for tid, tv in st.get("voiceover", {}).items():
         if isinstance(tv, list) and len(tv) == 2 and isinstance(tv[0], str):
@@ -290,6 +302,7 @@ def _load_state():
             _worker_assign[tid] = int(idx)
         except (TypeError, ValueError):
             pass
+    _index_muxed_dir()
 
 
 def _worker_url(i: int) -> str:
@@ -355,6 +368,8 @@ async def _mux_worker_loop():
             task_id, idx, src_fn, subfolder = item
             await _post_process(task_id, idx, src_fn, subfolder)
         except Exception as e:
+            if item:
+                _post_enqueued.discard(item[0])
             print(f"[mux-bg] task={item[0] if item else '?'} 失败: {e}", flush=True)
         finally:
             _post_queue.task_done()
@@ -667,16 +682,90 @@ async def _resolve_bgm(session, ref: str) -> Optional[str]:
     return None
 
 
+def _needs_post_process(task_id: str) -> bool:
+    """该任务是否需要口播 / 静音 / BGM 后处理。"""
+    return (task_id in _task_voiceover
+            or task_id in _task_noaudio
+            or task_id in _task_bgm)
+
+
+def _lookup_processed(task_id: str) -> Optional[str]:
+    """查找已完成的静音/混流文件（内存 + muxed/ 磁盘）。优先 muted_，其次 muxed_。"""
+    for name in (f"muted_{task_id}.mp4", f"muxed_{task_id}.mp4"):
+        path = _muxed.get(name) or os.path.join(MUX_DIR, name)
+        if os.path.isfile(path):
+            _muxed[name] = path
+            return name
+    return None
+
+
+def _output_phase(task_id: str) -> tuple:
+    """返回 (processed_name_or_None, phase)。
+
+    phase:
+      skip    — 不需要后处理，用原片
+      ready   — muted_/muxed_ 已就绪
+      pending — 需要后处理但尚未完成
+      failed  — ffmpeg 已失败，不再重试
+    """
+    if not _needs_post_process(task_id):
+        return None, "skip"
+    name = _lookup_processed(task_id)
+    if name:
+        return name, "ready"
+    if task_id in _post_failed or task_id in _vo_done:
+        return None, "failed"
+    return None, "pending"
+
+
+def _enqueue_post(task_id: str, idx: int, src_fn: str, subfolder: str) -> None:
+    """入后台后处理队列；同一 task 只 put 一次，直到源文件缺失被允许重试。"""
+    if task_id in _post_enqueued or task_id in _vo_done or task_id in _post_failed:
+        return
+    if _lookup_processed(task_id):
+        return
+    if _post_queue is None:
+        return
+    _post_enqueued.add(task_id)
+    _post_queue.put_nowait((task_id, idx, src_fn, subfolder or ""))
+
+
+def _collect_video_files(entry: dict) -> list:
+    video_files = []
+    for node_out in entry.get("outputs", {}).values():
+        for out in node_out.get("images", []) + node_out.get("video", []):
+            if isinstance(out, dict) and out.get("filename"):
+                video_files.append(out)
+    return video_files
+
+
+def _public_base(request: Request) -> str:
+    host = request.headers.get("host", "localhost:8000")
+    return f"http://{host}"
+
+
+def _video_url(base: str, filename: str, subfolder: str = "") -> str:
+    url = f"{base}/api/v1/video/{filename}"
+    if subfolder:
+        url += f"?subfolder={subfolder}"
+    return url
+
+
 async def _post_process(task_id: str, idx: int, src_filename: str, subfolder: str) -> Optional[str]:
-    """任务完成后按需后处理（口播混流 / 静音 / BGM），只做一次，返回处理后文件名或 None。
+    """任务完成后按需后处理（口播混流 / 静音 / BGM），返回处理后文件名或 None。
 
     组合规则（no_audio=True 表示剥掉 H3 原生音效）：
       no_audio=True 且无口播且无 BGM -> 纯静音（剥掉原声）
       有口播 / 有 BGM -> 混流：原声（除非 no_audio）+ 口播 + BGM（按音量叠加、循环、淡出）
+
+    源文件尚未落盘时不记入 _vo_done，下次轮询可重试；ffmpeg 失败才终结。
     """
-    if task_id in _vo_done:
+    existing = _lookup_processed(task_id)
+    if existing:
+        _vo_done.add(task_id)
+        return existing
+    if task_id in _vo_done or task_id in _post_failed:
         return None
-    _vo_done.add(task_id)
     text = voice = None
     if task_id in _task_voiceover:
         text, voice = _task_voiceover[task_id]
@@ -687,6 +776,8 @@ async def _post_process(task_id: str, idx: int, src_filename: str, subfolder: st
 
     src = await _resolve_src(task_id, idx, src_filename, subfolder)
     if not src:
+        # 原片可能刚落盘，放开入队标记以便下次轮询重试
+        _post_enqueued.discard(task_id)
         return None
 
     inputs = ["ffmpeg", "-y", "-i", src]
@@ -748,9 +839,57 @@ async def _post_process(task_id: str, idx: int, src_filename: str, subfolder: st
     if code != 0 or not os.path.exists(out_path):
         print(f"[post-process] {task_id} 后处理失败: rc={code} {err.decode(errors='replace')[:300]}",
               flush=True)
+        _vo_done.add(task_id)
+        _post_failed.add(task_id)
         return None
     _muxed[out_name] = out_path
+    _vo_done.add(task_id)
     return out_name
+
+
+async def _resolve_result_videos(task_id: str, idx: int, video_files: list, request: Request):
+    """根据后处理阶段决定任务终态。
+
+    返回 (status, extra)：
+      processing + audio_processing — 需要后处理但尚未完成，不交原片 URL
+      error — ffmpeg 已失败
+      success + videos — 原片或不需等待的成片；ready 时带 audio_processed
+    """
+    if not video_files:
+        return "success", {}
+
+    first = video_files[0]
+    src_fn = first.get("filename")
+    sub = first.get("subfolder", "") or ""
+    _video_worker[src_fn] = idx
+
+    mux_name, phase = _output_phase(task_id)
+    if phase == "pending":
+        if _post_queue is not None:
+            _enqueue_post(task_id, idx, src_fn, sub)
+        else:
+            mux_name = await _post_process(task_id, idx, src_fn, sub)
+            if mux_name:
+                phase = "ready"
+            elif task_id in _post_failed:
+                phase = "failed"
+
+    if phase == "pending":
+        return "processing", {"audio_processing": True}
+    if phase == "failed":
+        return "error", {"error": "audio post-process failed"}
+
+    base = _public_base(request)
+    if phase == "ready":
+        urls = [_video_url(base, mux_name)]
+        extra = {"videos": urls, "audio_processed": True}
+    else:
+        urls = [_video_url(base, src_fn, sub)]
+        extra = {"videos": urls}
+    for f in video_files[1:]:
+        _video_worker[f.get("filename")] = idx
+        extra["videos"].append(_video_url(base, f.get("filename"), f.get("subfolder", "") or ""))
+    return "success", extra
 
 
 @app.get("/health")
@@ -780,9 +919,13 @@ async def health():
 @app.get("/api/v1/video/{filename}")
 async def video_proxy(filename: str, subfolder: str = ""):
     """从产出该视频的 ComfyUI worker 代理输出视频文件，避免外部调用者直接访问 worker 端口。"""
-    # 口播混流文件直接伺服本地磁盘
+    # 口播/静音后处理文件直接伺服本地磁盘（含重启后尚未登记进 _muxed 的）
     if filename in _muxed:
         return FileResponse(_muxed[filename], media_type="video/mp4")
+    disk = os.path.join(MUX_DIR, filename)
+    if filename.startswith(("muted_", "muxed_")) and os.path.isfile(disk):
+        _muxed[filename] = disk
+        return FileResponse(disk, media_type="video/mp4")
     from fastapi.responses import Response
     order = ([_video_worker[filename]] if filename in _video_worker
              else list(range(len(COMFY_WORKERS))))
@@ -824,52 +967,22 @@ async def task_status(task_id: str, request: Request):
     completed = status.get("completed")
     status_str = "success" if completed else "error"
 
-    video_files = []
-    if completed:
-        for node_out in entry.get("outputs", {}).values():
-            for out in node_out.get("images", []) + node_out.get("video", []):
-                if isinstance(out, dict) and out.get("filename"):
-                    video_files.append(out)
-
     result = {
         "task_id": task_id,
         "status": status_str,
         "progress": None,
     }
-    if video_files:
-        host = request.headers.get("host", "localhost:8000")
-        base = f"http://{host}"
-        result["videos"] = []
-        first = video_files[0]
-        _video_worker[first.get("filename")] = idx
-        # 后处理（口播混流 / 静音）：入后台队列，不阻塞 /task 轮询返回
-        # 客户端再次轮询时会通过 _post_done 检测是否完成
-        if _post_queue is not None:
-            _post_queue.put_nowait((task_id, idx,
-                                    first.get("filename"),
-                                    first.get("subfolder", "")))
-            mux_name = None  # 后台处理中
-        else:
-            mux_name = await _post_process(task_id, idx,
-                                           first.get("filename"),
-                                           first.get("subfolder", ""))
-        first_url = f"{base}/api/v1/video/{mux_name or first['filename']}"
-        # 未混流时带 subfolder，否则代理按输出根目录查找会 404（如 gpu1 的 video/ 子目录）
-        if not mux_name and first.get("subfolder"):
-            first_url += f"?subfolder={first['subfolder']}"
-        result["videos"].append(first_url)
-        if mux_name:
-            result["audio_processed"] = True
-        for f in video_files[1:]:
-            _video_worker[f.get("filename")] = idx
-            url = f"{base}/api/v1/video/{f.get('filename')}"
-            if f.get("subfolder"):
-                url += f"?subfolder={f['subfolder']}"
-            result["videos"].append(url)
+    if completed:
+        video_files = _collect_video_files(entry)
+        if video_files:
+            phase, extra = await _resolve_result_videos(task_id, idx, video_files, request)
+            result["status"] = phase
+            result.update(extra)
     if status.get("messages"):
         for msg in status["messages"]:
             if isinstance(msg, list) and len(msg) == 2 and isinstance(msg[1], dict):
                 if msg[0] == "execution_error":
+                    result["status"] = "error"
                     result["error"] = msg[1].get("message", str(msg[1]))
     return result
 
@@ -1020,41 +1133,21 @@ async def openai_video_status(task_id: str, request: Request):
     completed = status.get("completed")
 
     if completed:
-        result = {"id": task_id, "status": "completed"}
-        video_files = []
-        for node_out in entry.get("outputs", {}).values():
-            for out in node_out.get("images", []) + node_out.get("video", []):
-                if isinstance(out, dict) and out.get("filename"):
-                    video_files.append(out)
-
+        video_files = _collect_video_files(entry)
         if video_files:
-            host = request.headers.get("host", "localhost:8000")
-            base = f"http://{host}"
-            data = []
-            first = video_files[0]
-            _video_worker[first.get("filename")] = idx
-            # 后处理（口播混流 / 静音）：入后台队列，不阻塞 /task 轮询返回
-            if _post_queue is not None:
-                _post_queue.put_nowait((task_id, idx,
-                                        first.get("filename"),
-                                        first.get("subfolder", "")))
-                mux_name = None
-            else:
-                mux_name = await _post_process(task_id, idx,
-                                               first.get("filename"),
-                                               first.get("subfolder", ""))
-            first_url = f"{base}/api/v1/video/{mux_name or first['filename']}"
-            if not mux_name and first.get("subfolder"):
-                first_url += f"?subfolder={first['subfolder']}"
-            data.append({"url": first_url})
-            for f in video_files[1:]:
-                _video_worker[f.get("filename")] = idx
-                url = f"{base}/api/v1/video/{f.get('filename')}"
-                if f.get("subfolder"):
-                    url += f"?subfolder={f['subfolder']}"
-                data.append({"url": url})
-            result["data"] = data
-        return result
+            phase, extra = await _resolve_result_videos(task_id, idx, video_files, request)
+            if phase == "processing":
+                return {"id": task_id, "status": "processing"}
+            if phase == "error":
+                return {"id": task_id, "status": "failed",
+                        "error": extra.get("error", "audio post-process failed")}
+            result = {"id": task_id, "status": "completed"}
+            if extra.get("videos"):
+                result["data"] = [{"url": u} for u in extra["videos"]]
+            if extra.get("audio_processed"):
+                result["audio_processed"] = True
+            return result
+        return {"id": task_id, "status": "completed"}
 
     # 检查是否有执行错误
     if status.get("messages"):
@@ -1078,17 +1171,23 @@ async def openai_video_content(task_id: str, request: Request):
     if not entry or not entry.get("status", {}).get("completed"):
         raise HTTPException(status_code=404, detail="video not ready")
 
-    for node_out in entry.get("outputs", {}).values():
-        for out in node_out.get("images", []) + node_out.get("video", []):
-            if isinstance(out, dict) and out.get("filename"):
-                _video_worker[out["filename"]] = idx
-                host = request.headers.get("host", "localhost:8000")
-                url = f"http://{host}/api/v1/video/{out['filename']}"
-                if out.get("subfolder"):
-                    url += f"?subfolder={out['subfolder']}"
-                return RedirectResponse(url=url, status_code=302)
+    video_files = _collect_video_files(entry)
+    if not video_files:
+        raise HTTPException(status_code=404, detail="video not found")
 
-    raise HTTPException(status_code=404, detail="video not found")
+    first = video_files[0]
+    _video_worker[first["filename"]] = idx
+    processed = _lookup_processed(task_id)
+    if processed:
+        return RedirectResponse(url=_video_url(_public_base(request), processed),
+                                status_code=302)
+    if _needs_post_process(task_id):
+        _enqueue_post(task_id, idx, first.get("filename"), first.get("subfolder", "") or "")
+        raise HTTPException(status_code=404, detail="video not ready")
+
+    return RedirectResponse(
+        url=_video_url(_public_base(request), first["filename"], first.get("subfolder", "") or ""),
+        status_code=302)
 
 
 if __name__ == "__main__":

@@ -10,16 +10,25 @@
 """
 
 import asyncio
+import base64
+import io
 import json
+import math
 import os
+import re
+import subprocess
+import sys
 import time
+import urllib.parse
 import uuid
+from typing import Optional
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from PIL import Image
 from pydantic import BaseModel, Field
 
 # ---- 配置 ----
@@ -36,7 +45,15 @@ AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 
 DEFAULT_STEPS = 10  # 10 步为速度/质量折中（20 步约慢 1.7 倍）
 DEFAULT_FPS = 24
-MAX_DURATION = 20  # 模型训练区间 ~5-15s；>15s 未经验证，但节点支持到更长，按需放开
+MAX_DURATION = 10  # 模型训练区间 ~5-15s；本地实测 10s 不 OOM（显存 98.2%），与 generate_h3 的 --duration 上限保持一致
+
+# 口播（edge-tts + ffmpeg 混流）
+VOICE_DEFAULT = "zh-CN-XiaoxiaoNeural"  # 默认音色（女声，新闻/小说）
+BASE_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ComfyUI", "output")
+OUTPUT_DIRS = [BASE_OUTPUT_DIR, os.path.join(BASE_OUTPUT_DIR, "gpu1")]  # 与 COMFY_WORKERS 对应
+MUX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "muxed")
+# 任务元数据（口播文案/音色、静音标记、worker 分配）持久化文件，服务重启后仍可恢复
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_state.json")
 
 
 def frame_count_for_duration(duration: float) -> int:
@@ -45,11 +62,61 @@ def frame_count_for_duration(duration: float) -> int:
     return n + (5 - n % 17) % 17
 
 
+def adapt_canvas_size(width: int, height: int) -> tuple:
+    """短边 768、面积上限 768*1344、逐轴对齐 32 的画布（与 H3 节点 adapt_canvas 一致）。"""
+    ratio = width / height
+    if ratio >= 1.0:
+        nom_w, nom_h = 768 * ratio, 768
+    else:
+        nom_w, nom_h = 768, 768 / ratio
+    if nom_w * nom_h > 768 * 1344:
+        s = math.sqrt(768 * 1344 / (nom_w * nom_h))
+        nom_w, nom_h = nom_w * s, nom_h * s
+    return max(32, round(nom_w / 32) * 32), max(32, round(nom_h / 32) * 32)
+
+
+def image_size(data: bytes) -> tuple:
+    """从图片字节读取原始宽高。"""
+    with Image.open(io.BytesIO(data)) as im:
+        return im.size
+
+
+_UPLOAD_EXT = ("png", "jpg", "jpeg", "webp",
+               "mp3", "wav", "ogg", "m4a", "aac", "flac", "mp4", "mov")
+
+
+def image_upload_name(ref: str) -> str:
+    """从 URL / data URI 派生一个合法的上传文件名（uuid 前缀避免跨任务缓存冲突）。
+
+    图片保留图片扩展名，音频（BGM）保留音频扩展名——扩展名会被 ffmpeg 用于选择
+    解复用器，BGM 被改名成 .png 会导致 ffmpeg 按 image2 解复用而混流失败。
+    """
+    ext = "png"
+    if ref.startswith("data:"):
+        mime = ref[5:ref.find(";")].lower() if ";" in ref[:64] else "image/png"
+        ext = {"image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp",
+               "audio/mpeg": "mp3", "audio/wav": "wav", "audio/wave": "wav",
+               "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/aac": "aac"}.get(mime, "png")
+    else:
+        ext = os.path.splitext(urllib.parse.urlparse(ref).path)[1].lstrip(".").lower()
+        if ext not in _UPLOAD_EXT:
+            ext = "png"
+    return f"i2v_{uuid.uuid4().hex[:12]}.{ext}"
+
+
 def build_prompt(prompt: str, width: int, height: int, duration: float,
-                 seed: int, steps: int) -> dict:
-    """构造 ComfyUI API 格式的 prompt（与官方 T2V 工作流等价，使用完整 INT8 模型）。"""
+                 seed: int, steps: int,
+                 first_frame: Optional[str] = None,
+                 last_frame: Optional[str] = None,
+                 prefix: Optional[str] = None) -> dict:
+    """构造 ComfyUI API 格式的 prompt（与官方 T2V 工作流等价，使用完整 INT8 模型）。
+
+    first_frame/last_frame 为已上传到该 worker input 目录的图片文件名；
+    传图片即图生视频（fl2va），不传则为文生视频（t2va）。
+    prefix 为每个任务唯一的输出文件名前缀，避免双 worker 序号碰撞导致覆盖。
+    """
     length = frame_count_for_duration(duration)
-    return {
+    graph = {
         "1": {"class_type": "UNETLoader",
               "inputs": {"unet_name": DIFFUSION_MODEL, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader",
@@ -75,18 +142,85 @@ def build_prompt(prompt: str, width: int, height: int, duration: float,
                "inputs": {"images": ["11", 0], "audio": ["12", 0],
                           "fps": DEFAULT_FPS, "bit_depth": 8}},
         "14": {"class_type": "SaveVideo",
-               "inputs": {"video": ["13", 0], "filename_prefix": "video/minimax_h3",
+               "inputs": {"video": ["13", 0],
+                          "filename_prefix": f"video/minimax_{prefix or 'h3'}",
                           "format": "mp4", "codec": "auto"}},
     }
+    node = graph["5"]["inputs"]
+    if first_frame:
+        graph["15"] = {"class_type": "LoadImage", "inputs": {"image": first_frame}}
+        node["first_frame"] = ["15", 0]
+    if last_frame:
+        graph["16"] = {"class_type": "LoadImage", "inputs": {"image": last_frame}}
+        node["last_frame"] = ["16", 0]
+    return graph
+
+
+def build_ref2v_prompt(prompt: str, width: int, height: int, duration: float,
+                       seed: int, steps: int,
+                       ref_images: list,
+                       ref_image_size: str = "max",
+                       prefix: Optional[str] = None) -> dict:
+    """构造 ComfyUI API 格式的 ref2va prompt（MiniMaxH3ReferenceToVideo）。
+
+    参考图以 <Picture i> 形式参与 conditioning，是人物/商品跨镜头一致性的身份锚点；
+    故事版风格引用 @ImageN / @图片N 会被重写为 <Picture N>。ref_images 为已上传到
+    worker input 目录的图片文件名列表（≤9 张，节点上限）。
+    """
+    length = frame_count_for_duration(duration)
+    graph = {
+        "1": {"class_type": "UNETLoader",
+              "inputs": {"unet_name": DIFFUSION_MODEL, "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": TEXT_ENCODER, "type": "minimax", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": VIDEO_VAE}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": AUDIO_VAE}},
+        "5": {"class_type": "MiniMaxH3ReferenceToVideo",
+              "inputs": {"clip": ["2", 0], "vae": ["3", 0], "audio_vae": ["4", 0],
+                         "prompt": prompt, "width": width, "height": height,
+                         "length": length, "ref_image_size": ref_image_size,
+                         "ref_images": {f"ref_image_{i}": [str(15 + i), 0]
+                                        for i in range(len(ref_images))}}},
+        "6": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+        "7": {"class_type": "BasicScheduler",
+              "inputs": {"model": ["1", 0], "scheduler": "simple",
+                         "steps": steps, "denoise": 1.0}},
+        "8": {"class_type": "BasicGuider",
+              "inputs": {"model": ["1", 0], "conditioning": ["5", 0]}},
+        "9": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "10": {"class_type": "SamplerCustomAdvanced",
+               "inputs": {"noise": ["9", 0], "guider": ["8", 0], "sampler": ["6", 0],
+                          "sigmas": ["7", 0], "latent_image": ["5", 1]}},
+        "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}},
+        "12": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["10", 0], "vae": ["4", 0]}},
+        "13": {"class_type": "CreateVideo",
+               "inputs": {"images": ["11", 0], "audio": ["12", 0],
+                          "fps": DEFAULT_FPS, "bit_depth": 8}},
+        "14": {"class_type": "SaveVideo",
+               "inputs": {"video": ["13", 0],
+                          "filename_prefix": f"video/minimax_{prefix or 'h3'}",
+                          "format": "mp4", "codec": "auto"}},
+    }
+    for i, name in enumerate(ref_images):
+        graph[str(15 + i)] = {"class_type": "LoadImage", "inputs": {"image": name}}
+    return graph
 
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="视频提示词（含画面 + 运镜 + 音频描述）")
-    width: int = Field(1344, ge=32, le=2048)
-    height: int = Field(768, ge=32, le=2048)
+    width: Optional[int] = Field(None, ge=32, le=2048, description="视频宽度；图生视频缺省时按图片自适应")
+    height: Optional[int] = Field(None, ge=32, le=2048, description="视频高度；图生视频缺省时按图片自适应")
     duration: float = Field(5.0, ge=1.0, le=MAX_DURATION, description="视频时长（秒）")
     seed: int = Field(0, ge=0, le=2 ** 64 - 1)
     steps: int = Field(DEFAULT_STEPS, ge=1, le=100)
+    first_frame: Optional[str] = Field(None, description="首帧图片：http(s) URL 或 data: URI")
+    last_frame: Optional[str] = Field(None, description="尾帧图片：http(s) URL 或 data: URI")
+    image: Optional[str] = Field(None, description="单图快捷方式（等价于 first_frame）")
+    voiceover: Optional[str] = Field(None, description="口播文案，非空时任务完成后自动合成配音混流")
+    voice: Optional[str] = Field(None, description="口播音色 ID，默认 zh-CN-XiaoxiaoNeural")
+    no_audio: bool = Field(False, description="为 true 时剥掉 H3 原生音效（静音），可与口播/BGM 组合")
+    bgm: Optional[str] = Field(None, description="BGM 背景音乐：本地路径、http(s) URL 或已上传文件名，非空时任务完成后自动混入")
+    bgm_volume: float = Field(0.3, ge=0.0, le=1.0, description="BGM 相对音量，默认 0.3")
 
 
 app = FastAPI(title="MiniMax-H3 视频生成 API", version="1.0.0")
@@ -100,7 +234,54 @@ _workers = []        # 每个 ComfyUI 实例一个 aiohttp 会话，下标与 CO
 _worker_assign = {}  # task_id -> worker 索引
 _video_worker = {}   # 输出文件名 -> worker 索引
 _rr = 0              # 兜底轮询游标
-_submit_lock = asyncio.Lock()  # 串行化“选 worker + 提交”，避免并发提交时队列长度读到旧值
+# 并发改造：去掉 _submit_lock，改为 _local_load 预留式调度
+# _local_load[i] = 已选 worker i 但 /prompt 尚未返回的"在飞任务"数
+# 选 worker 时按 (远程队列长度 + 本地在飞) 之和最小选，避免并发都冲到同一个 worker
+_local_load = []
+_pick_lock = asyncio.Lock()  # 仅保护 _pick_worker 内的"读 /queue + 写 _local_load"原子性
+_task_voiceover = {}  # task_id -> (口播文案, 音色)
+_task_noaudio = set() # task_id -> 静音（剥掉原声）
+_task_bgm = {}        # task_id -> (BGM 引用, 音量)
+_muxed = {}           # 混流后文件名 -> 本地路径
+_vo_done = set()      # 已尝试后处理的 task_id（成功或失败都不再重试）
+
+
+def _save_state():
+    """把任务元数据写入磁盘，服务重启后可恢复，避免口播等后处理静默丢失。"""
+    st = {
+        "voiceover": {tid: [text, voice] for tid, (text, voice) in _task_voiceover.items()},
+        "noaudio": sorted(_task_noaudio),
+        "bgm": {tid: [ref, vol] for tid, (ref, vol) in _task_bgm.items()},
+        "assign": _worker_assign,
+    }
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+def _load_state():
+    """启动时从磁盘恢复任务元数据。"""
+    try:
+        with open(STATE_FILE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return
+    for tid, tv in st.get("voiceover", {}).items():
+        if isinstance(tv, list) and len(tv) == 2 and isinstance(tv[0], str):
+            _task_voiceover[tid] = (tv[0], tv[1])
+    _task_noaudio.update(st.get("noaudio", []))
+    for tid, bv in st.get("bgm", {}).items():
+        if isinstance(bv, list) and len(bv) == 2 and isinstance(bv[0], str):
+            _task_bgm[tid] = (bv[0], float(bv[1]) if isinstance(bv[1], (int, float)) else 0.3)
+    for tid, idx in st.get("assign", {}).items():
+        try:
+            _worker_assign[tid] = int(idx)
+        except (TypeError, ValueError):
+            pass
 
 
 def _worker_url(i: int) -> str:
@@ -109,8 +290,10 @@ def _worker_url(i: int) -> str:
 
 @app.on_event("startup")
 async def startup():
-    global _workers
+    global _workers, _local_load
     _workers = [aiohttp.ClientSession() for _ in COMFY_WORKERS]
+    _local_load = [0] * len(COMFY_WORKERS)  # 并发调度：每个 worker 的"已预留"计数
+    _load_state()  # 恢复任务元数据（口播/静音/worker 分配），防止重启丢失
 
 
 @app.on_event("shutdown")
@@ -120,22 +303,390 @@ async def shutdown():
 
 
 async def _pick_worker() -> int:
-    """选择队列（运行中+排队中）最短的 worker；全部不可达时按轮询兜底。"""
+    """选择（远程队列长度 + 本地在飞）最小的 worker；全部不可达时按轮询兜底。
+
+    并发改造点：
+    1. 读各 worker 的 /queue + 本地 _local_load 之和选最小
+    2. 选中的 worker 在 _local_load 上 +1（"预留"），避免后续并发请求都选同一个
+    3. 调用方在 /prompt 返回（成功或失败）后调用 _release_worker(idx) 释放预留
+    4. _pick_lock 保护"读 + 写 _local_load"的原子性，但只锁这一小段，请求主体不阻塞
+
+    注意：_local_load 是预估值（"已选未提交"），不是真实负载；ComfyUI 实际队列长度可能滞后
+    """
     global _rr
-    best, best_load = 0, 10 ** 9
-    for i in range(len(COMFY_WORKERS)):
+    async with _pick_lock:
+        best, best_load = 0, 10 ** 9
+        for i in range(len(COMFY_WORKERS)):
+            try:
+                async with _workers[i].get(f"{_worker_url(i)}/queue") as resp:
+                    data = await resp.json()
+                remote = len(data.get("queue_running", [])) + len(data.get("queue_pending", []))
+            except Exception:
+                remote = 10 ** 9
+            load = remote + _local_load[i]
+            if load < best_load:
+                best, best_load = i, load
+        if best_load == 10 ** 9:
+            best = _rr % len(COMFY_WORKERS)
+        _rr += 1
+        _local_load[best] += 1
+        return best
+
+
+async def _release_worker(idx: int):
+    """释放 worker 预留。/prompt 返回后调用（成功或失败都调）。"""
+    async with _pick_lock:
+        if 0 <= idx < len(_local_load):
+            _local_load[idx] = max(0, _local_load[idx] - 1)
+
+
+# ComfyUI 共享 input 目录（两个 worker 共用）
+INPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ComfyUI", "input")
+
+
+def _is_uploaded_ref(ref: Optional[str]) -> bool:
+    """裸文件名（如 /api/v1/upload 返回的）视为已上传到 ComfyUI input 目录，直接引用。"""
+    return bool(ref) and not ref.startswith(("http://", "https://", "data:")) and "/" not in ref
+
+
+async def _resolve_image(session, ref: str) -> bytes:
+    """图片引用（http(s) URL 或 data: URI）-> 原始字节。"""
+    if ref.startswith("data:"):
+        return base64.b64decode(ref.split(",", 1)[1])
+    if not ref.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400,
+                            detail="无法识别的图片引用，应为 http(s) URL、data: URI、"
+                                   "/api/v1/upload 返回的文件名或服务器本地文件路径")
+    async with session.get(ref, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+        if resp.status != 200:
+            raise HTTPException(status_code=400, detail=f"无法下载图片（{resp.status}）: {ref[:100]}")
+        return await resp.read()
+
+
+async def _fetch_frame_bytes(session, ref: Optional[str]) -> tuple:
+    """解析图片引用 -> (直接使用的文件名, 待上传字节)，两者至多其一非 None。
+
+    裸文件名（已上传）直接返回；服务器本地已存在的路径（绝对或 input 相对）读取字节；
+    http(s) URL / data URI 下载字节。
+    """
+    if not ref:
+        return None, None
+    if _is_uploaded_ref(ref):
+        # 已上传的裸文件名：若文件在共享 input 目录，顺带读取字节用于画布自适应（不回传重新上传）
+        for p in [os.path.join(INPUT_DIR, ref)]:
+            if os.path.exists(p):
+                with open(p, "rb") as f:
+                    return ref, f.read()
+        return ref, None
+    candidates = [ref]
+    if "/" in ref and not os.path.isabs(ref):
+        candidates.append(os.path.join(INPUT_DIR, ref))
+    for p in candidates:
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                return None, f.read()
+    return None, await _resolve_image(session, ref)
+
+
+async def _upload_image(session, worker_url: str, name: str, data: bytes) -> str:
+    """上传图片到 ComfyUI worker 的 input 目录，返回 LoadImage 可引用的文件名。"""
+    ext = os.path.splitext(name)[1].lower()
+    ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+             "webp": "image/webp"}.get(ext, "image/png")
+    form = aiohttp.FormData()
+    form.add_field("image", data, filename=name, content_type=ctype)
+    async with session.post(f"{worker_url}/upload/image", data=form) as resp:
+        if resp.status != 200:
+            raise HTTPException(status_code=502, detail=await resp.text())
+        info = await resp.json()
+    return info["name"]
+
+
+@app.post("/api/v1/upload")
+async def upload_image(request: Request):
+    """上传自定义图片（multipart，字段名 file）到共享 input 目录，返回文件名供 first_frame/last_frame 引用。"""
+    form = await request.form()
+    file = form.get("file")
+    if file is None or not getattr(file, "filename", None):
+        raise HTTPException(status_code=400, detail="缺少 file 字段（multipart/form-data 上传）")
+    data = await file.read()
+    if len(data) > 30 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="图片超过 30MB 限制")
+    name = await _upload_image(_workers[0], _worker_url(0),
+                               image_upload_name(file.filename), data)
+    return {"filename": name}
+
+
+async def _submit_job(prompt: str, width: Optional[int], height: Optional[int],
+                      duration: float, seed: int, steps: int,
+                      first_frame: Optional[str] = None,
+                      last_frame: Optional[str] = None,
+                      voiceover: Optional[str] = None,
+                      voice: Optional[str] = None,
+                      no_audio: bool = False,
+                      bgm: Optional[str] = None,
+                      bgm_volume: float = 0.3) -> tuple:
+    """选择 worker、读取/上传首尾帧、提交图生/文生任务，返回 (task_id, worker_idx)。
+
+    first_frame/last_frame 支持四种引用：http(s) URL、data: URI、
+    /api/v1/upload 返回的裸文件名、服务器本地图片路径（绝对或 input 相对）。
+    voiceover 非空时，任务完成后自动用 edge-tts 合成口播并 ffmpeg 混流；
+    no_audio=True 时剥掉 H3 原生音效；bgm 非空时自动混入背景音乐（可组合）。
+    """
+    # 图片读取/下载放在锁外，避免大图/慢链接阻塞其他任务；裸文件名直接使用
+    ff_ref, ff_data = await _fetch_frame_bytes(_workers[0], first_frame)
+    lf_ref, lf_data = await _fetch_frame_bytes(_workers[0], last_frame)
+    if (ff_data or lf_data) and (width is None or height is None):
+        width, height = adapt_canvas_size(*image_size(ff_data or lf_data))
+    if width is None or height is None:
+        width, height = 1344, 768
+
+    task_id = str(uuid.uuid4())
+    if voiceover:
+        _task_voiceover[task_id] = (voiceover, voice or VOICE_DEFAULT)
+    if no_audio:
+        _task_noaudio.add(task_id)
+    if bgm:
+        _task_bgm[task_id] = (bgm, bgm_volume)
+    # 并发改造：先在外层预留 worker idx（在 _pick_lock 内已 _local_load[idx]+1），
+    # 再只在"上传 + 提交"这段短暂持锁；上传失败也必须释放预留，避免 _local_load 单调累加
+    idx = await _pick_worker()
+    try:
+        session, base = _workers[idx], _worker_url(idx)
+        ff_name = (ff_ref or
+                   (await _upload_image(session, base, image_upload_name(first_frame), ff_data)
+                    if ff_data else None))
+        lf_name = (lf_ref or
+                   (await _upload_image(session, base, image_upload_name(last_frame), lf_data)
+                    if lf_data else None))
+        prompt_graph = build_prompt(prompt, width, height, duration, seed, steps,
+                                    ff_name, lf_name, prefix=task_id[:12])
+        payload = {"prompt": prompt_graph, "client_id": "api-wrapper", "prompt_id": task_id}
+        async with session.post(f"{base}/prompt", json=payload) as resp:
+            body = await resp.json()
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=body)
+    finally:
+        # /prompt 已成功入队（或失败抛出），释放预留；HTTPException 会冒泡给上层
+        await _release_worker(idx)
+    _worker_assign[task_id] = idx
+    _save_state()  # 持久化任务元数据，重启后仍可完成后处理
+    return task_id, idx
+
+
+async def _submit_ref2v_job(prompt: str, width: Optional[int], height: Optional[int],
+                            duration: float, seed: int, steps: int,
+                            ref_images: list,
+                            ref_image_size: str = "match",
+                            voiceover: Optional[str] = None,
+                            voice: Optional[str] = None,
+                            no_audio: bool = False,
+                            bgm: Optional[str] = None,
+                            bgm_volume: float = 0.3) -> tuple:
+    """上传参考图并提交 ref2va 任务，返回 (task_id, worker_idx)。
+
+    ref_images 支持与 first_frame/last_frame 相同的四种引用（http(s) URL、data: URI、
+    /api/v1/upload 返回的裸文件名、服务器本地路径），节点上限 9 张：保留前 9 张
+    （定妆照排在最前，其次为各分镜关键帧），超出部分直接丢弃。
+    """
+    refs = ref_images[:9]
+    # 图片读取/下载放在锁外，避免大图/慢链接阻塞其他任务
+    refs_data = []
+    for ref in refs:
+        name, data = await _fetch_frame_bytes(_workers[0], ref)
+        refs_data.append((ref, name, data))
+    if (width is None or height is None) and refs_data:
+        # 参考图缺省时按第一张有内容的图自适应画布
+        for _, _, data in refs_data:
+            if data:
+                width, height = adapt_canvas_size(*image_size(data))
+                break
+    if width is None or height is None:
+        width, height = 1344, 768
+
+    task_id = str(uuid.uuid4())
+    if voiceover:
+        _task_voiceover[task_id] = (voiceover, voice or VOICE_DEFAULT)
+    if no_audio:
+        _task_noaudio.add(task_id)
+    if bgm:
+        _task_bgm[task_id] = (bgm, bgm_volume)
+    idx = await _pick_worker()
+    try:
+        session, base = _workers[idx], _worker_url(idx)
+        names = []
+        for ref, name, data in refs_data:
+            if name:
+                names.append(name)
+            else:
+                names.append(await _upload_image(session, base, image_upload_name(ref), data))
+        prompt_graph = build_ref2v_prompt(prompt, width, height, duration, seed, steps,
+                                          names, ref_image_size, prefix=task_id[:12])
+        payload = {"prompt": prompt_graph, "client_id": "api-wrapper", "prompt_id": task_id}
+        async with session.post(f"{base}/prompt", json=payload) as resp:
+            body = await resp.json()
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=body)
+    finally:
+        await _release_worker(idx)
+    _worker_assign[task_id] = idx
+    _save_state()
+    return task_id, idx
+
+
+async def _run_cmd(cmd: list) -> tuple:
+    """异步运行子进程，返回 (returncode, stderr)。"""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await proc.communicate()
+    return proc.returncode, err
+
+
+async def _resolve_src(task_id: str, idx: int, src_filename: str, subfolder: str) -> Optional[str]:
+    """定位生成视频的本地路径；磁盘缺失时回退从 worker HTTP 拉取。"""
+    os.makedirs(MUX_DIR, exist_ok=True)
+    src = os.path.join(OUTPUT_DIRS[idx], subfolder or "", src_filename)
+    if os.path.exists(src):
+        return src
+    try:
+        async with _workers[idx].get(
+                f"{_worker_url(idx)}/view?filename={src_filename}&type=output"
+                + (f"&subfolder={subfolder}" if subfolder else "")) as resp:
+            if resp.status == 200:
+                src = os.path.join(MUX_DIR, f"src_{task_id}.mp4")
+                with open(src, "wb") as f:
+                    f.write(await resp.read())
+                return src
+    except Exception:
+        pass
+    return None
+
+
+async def _probe_duration(path: str) -> float:
+    """用 ffprobe 读取视频时长（秒），失败时返回 0。"""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    try:
+        return float(out.decode().strip())
+    except (ValueError, UnicodeDecodeError):
+        return 0.0
+
+
+async def _resolve_bgm(session, ref: str) -> Optional[str]:
+    """BGM 引用 -> 本地 ffmpeg 可读路径。
+
+    支持：服务器本地绝对路径、input 目录相对路径（含 /api/v1/upload 返回的裸文件名）、
+    http(s) URL（下载到 muxed 目录）。
+    """
+    if not ref:
+        return None
+    if ref.startswith(("http://", "https://")):
+        os.makedirs(MUX_DIR, exist_ok=True)
+        dest = os.path.join(MUX_DIR, f"bgm_{uuid.uuid4().hex[:12]}.mp3")
         try:
-            async with _workers[i].get(f"{_worker_url(i)}/queue") as resp:
-                data = await resp.json()
-            load = len(data.get("queue_running", [])) + len(data.get("queue_pending", []))
+            async with session.get(ref, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status != 200:
+                    return None
+                with open(dest, "wb") as f:
+                    f.write(await resp.read())
+            return dest
         except Exception:
-            load = 10 ** 9
-        if load < best_load:
-            best, best_load = i, load
-    if best_load == 10 ** 9:
-        best = _rr % len(COMFY_WORKERS)
-    _rr += 1
-    return best
+            return None
+    if os.path.isabs(ref) and os.path.exists(ref):
+        return ref
+    p = os.path.join(INPUT_DIR, ref)
+    if os.path.exists(p):
+        return p
+    return None
+
+
+async def _post_process(task_id: str, idx: int, src_filename: str, subfolder: str) -> Optional[str]:
+    """任务完成后按需后处理（口播混流 / 静音 / BGM），只做一次，返回处理后文件名或 None。
+
+    组合规则（no_audio=True 表示剥掉 H3 原生音效）：
+      no_audio=True 且无口播且无 BGM -> 纯静音（剥掉原声）
+      有口播 / 有 BGM -> 混流：原声（除非 no_audio）+ 口播 + BGM（按音量叠加、循环、淡出）
+    """
+    if task_id in _vo_done:
+        return None
+    _vo_done.add(task_id)
+    text = voice = None
+    if task_id in _task_voiceover:
+        text, voice = _task_voiceover[task_id]
+    mute = task_id in _task_noaudio
+    bgm_ref, bgm_volume = _task_bgm.get(task_id, (None, 0.3))
+    if not text and not mute and not bgm_ref:
+        return None
+
+    src = await _resolve_src(task_id, idx, src_filename, subfolder)
+    if not src:
+        return None
+
+    inputs = ["ffmpeg", "-y", "-i", src]
+    map_args = ["-map", "0:v", "-c:v", "copy"]
+
+    if text:
+        tts_path = os.path.join(MUX_DIR, f"tts_{task_id}.mp3")
+        code, err = await _run_cmd([sys.executable, "-m", "edge_tts",
+                                    "--text", text, "--voice", voice,
+                                    "--write-media", tts_path])
+        if code != 0 or not os.path.exists(tts_path):
+            text = None  # TTS 失败则退化为不处理口播
+            tts_path = None
+    else:
+        tts_path = None
+
+    bgm_path = await _resolve_bgm(_workers[0], bgm_ref) if bgm_ref else None
+
+    if mute and not tts_path and not bgm_path:
+        # 纯静音：剥掉音轨
+        cmd = inputs + map_args + ["-an"]
+    else:
+        # 至少一路音频（口播 / BGM / 原声），按需混流
+        audio_sources, labels = [], []
+        if not mute:
+            audio_sources.append("[0:a]aformat=sample_rates=44100:channel_layouts=stereo")
+            labels.append("[a0]")
+        if tts_path:
+            inputs += ["-i", tts_path]
+            audio_sources.append("[1:a]aformat=sample_rates=44100:channel_layouts=stereo,adelay=400|400")
+            labels.append("[a1]")
+        if bgm_path:
+            inputs += ["-stream_loop", "-1", "-i", bgm_path]
+            bgm_idx = 1 + (1 if tts_path else 0)  # bgm 输入在 inputs 中的实际下标
+            dur = await _probe_duration(src) or 10.0
+            fade = min(2.0, dur * 0.2)
+            audio_sources.append(
+                f"[{bgm_idx}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                f"volume={bgm_volume},atrim=0:{dur:.3f},asetpts=N/SR/TB,"
+                f"afade=t=out:st={max(0.0, dur - fade):.3f}:d={fade:.3f}")
+            labels.append(f"[a{bgm_idx}]")
+        mix_labels = "".join(labels)
+        filter_cmd = (f"{';'.join(s + l for s, l in zip(audio_sources, labels))};"
+                      f"{mix_labels}amix=inputs={len(labels)}"
+                      f":duration={'longest' if bgm_path else 'first'}"
+                      f":dropout_transition=0[aout]")
+        out_label = "[aout]"
+        if bgm_path:
+            # BGM/口播可能长于视频，最终裁齐到视频时长，避免音轨拖尾
+            filter_cmd += f";[aout]atrim=0:{dur:.3f},asetpts=N/SR/TB[fin]"
+            out_label = "[fin]"
+        cmd = (inputs + ["-filter_complex", filter_cmd,
+                         "-map", "0:v", "-map", out_label,
+                         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k"])
+
+    out_name = f"{'muted' if mute and not tts_path and not bgm_path else 'muxed'}_{task_id}.mp4"
+    out_path = os.path.join(MUX_DIR, out_name)
+    code, err = await _run_cmd(cmd + [out_path])
+    if code != 0 or not os.path.exists(out_path):
+        print(f"[post-process] {task_id} 后处理失败: rc={code} {err.decode(errors='replace')[:300]}",
+              flush=True)
+        return None
+    _muxed[out_name] = out_path
+    return out_name
 
 
 @app.get("/health")
@@ -153,6 +704,9 @@ async def health():
 @app.get("/api/v1/video/{filename}")
 async def video_proxy(filename: str, subfolder: str = ""):
     """从产出该视频的 ComfyUI worker 代理输出视频文件，避免外部调用者直接访问 worker 端口。"""
+    # 口播混流文件直接伺服本地磁盘
+    if filename in _muxed:
+        return FileResponse(_muxed[filename], media_type="video/mp4")
     from fastapi.responses import Response
     order = ([_video_worker[filename]] if filename in _video_worker
              else list(range(len(COMFY_WORKERS))))
@@ -169,18 +723,12 @@ async def video_proxy(filename: str, subfolder: str = ""):
 
 @app.post("/api/v1/generate", status_code=202)
 async def generate(req: GenerateRequest):
-    prompt_graph = build_prompt(req.prompt, req.width, req.height,
-                                req.duration, req.seed, req.steps)
-    task_id = str(uuid.uuid4())
-    async with _submit_lock:
-        idx = await _pick_worker()
-        payload = {"prompt": prompt_graph, "client_id": "api-wrapper", "prompt_id": task_id}
-        async with _workers[idx].post(f"{_worker_url(idx)}/prompt", json=payload) as resp:
-            body = await resp.json()
-            if resp.status != 200:
-                raise HTTPException(status_code=502, detail=body)
-    _worker_assign[task_id] = idx
-    return {"task_id": body.get("prompt_id", task_id),
+    task_id, idx = await _submit_job(req.prompt, req.width, req.height,
+                                     req.duration, req.seed, req.steps,
+                                     req.first_frame or req.image, req.last_frame,
+                                     req.voiceover, req.voice, req.no_audio,
+                                     req.bgm, req.bgm_volume)
+    return {"task_id": task_id,
             "status": "queued",
             "worker": idx,
             "frame_count": frame_count_for_duration(req.duration),
@@ -216,7 +764,20 @@ async def task_status(task_id: str, request: Request):
         host = request.headers.get("host", "localhost:8000")
         base = f"http://{host}"
         result["videos"] = []
-        for f in video_files:
+        first = video_files[0]
+        _video_worker[first.get("filename")] = idx
+        # 后处理（口播混流 / 静音）：任务完成后只对第一个视频处理一次
+        mux_name = await _post_process(task_id, idx,
+                                       first.get("filename"),
+                                       first.get("subfolder", ""))
+        first_url = f"{base}/api/v1/video/{mux_name or first['filename']}"
+        # 未混流时带 subfolder，否则代理按输出根目录查找会 404（如 gpu1 的 video/ 子目录）
+        if not mux_name and first.get("subfolder"):
+            first_url += f"?subfolder={first['subfolder']}"
+        result["videos"].append(first_url)
+        if mux_name:
+            result["audio_processed"] = True
+        for f in video_files[1:]:
             _video_worker[f.get("filename")] = idx
             url = f"{base}/api/v1/video/{f.get('filename')}"
             if f.get("subfolder"):
@@ -261,36 +822,101 @@ async def openai_image_generate():
 @app.post("/videos")
 @app.post("/videos/generations")
 async def openai_video_generate(request: Request):
-    """OpenAI 兼容的视频生成端点，接受灵活的请求体。"""
+    """OpenAI 兼容的视频生成端点，接受灵活的请求体。
+
+    支持图生视频：input 数组（OpenAI 风格，第 1 个为首帧、第 2 个为尾帧），
+    或 first_frame / last_frame / image 字段，值为 http(s) URL 或 data: URI。
+    传 reference_images（数组）时走 ref2va 路径：多张参考图全程参与 conditioning
+    （人物定妆照 + 分镜关键帧的身份锚定），prompt 中的 @ImageN / @图片N 引用会被
+    自动重写为 ref2va 的 <Picture N> 语法。
+    """
     body = await request.json()
     prompt = body.get("prompt", "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
-    # 分辨率解析：优先 width/height，其次 resolution token，最后默认值
+    # 首帧/尾帧解析：input 数组支持字符串（OpenAI 风格）与 {type:image_url} 对象，
+    # 第 1 个为首帧、第 2 个为尾帧；也可用 first_frame / last_frame / image 字段
+    inputs = body.get("input")
+    first_frame = body.get("first_frame") or body.get("image")
+    last_frame = body.get("last_frame")
+    if isinstance(inputs, list):
+        urls = []
+        for u in inputs:
+            if isinstance(u, str):
+                urls.append(u)
+            elif (isinstance(u, dict) and u.get("type") == "image_url"
+                  and isinstance(u.get("image_url"), dict)
+                  and isinstance(u["image_url"].get("url"), str)
+                  and u["image_url"]["url"]):
+                urls.append(u["image_url"]["url"])
+        if urls and not first_frame:
+            first_frame = urls[0]
+        if len(urls) > 1 and not last_frame:
+            last_frame = urls[1]
+    if not isinstance(first_frame, str):
+        first_frame = None
+    if not isinstance(last_frame, str):
+        last_frame = None
+
+    # 多参考图（ref2va 路径）：定妆照 + 各分镜关键帧作为人物/商品身份锚点。
+    # 与 input 不同，它们不是首尾帧，而是全程参与 conditioning（<Picture N> 引用）。
+    reference_images = body.get("reference_images") or body.get("referenceImageUrls")
+    refs = []
+    if isinstance(reference_images, list):
+        refs = [u for u in reference_images if isinstance(u, str) and u.strip()][:9]
+
+    # 分辨率解析：优先 width/height，其次 resolution token；图生视频缺省时由图片自适应
+    w = h = None
     if body.get("width") and body.get("height"):
         w, h = int(body["width"]), int(body["height"])
     elif body.get("resolution") and body["resolution"] in RESOLUTION_MAP:
         w, h = RESOLUTION_MAP[body["resolution"]]
-    else:
-        w, h = 1344, 768
+    if w and h:
+        # H3 的 latent 要求画布尺寸能被 32 整除（patchify 按 patch 2 切分），而标准
+        # 1080p/720p/480p（1920x1080 / 1280x720 / 854x480）在短边都不满足：
+        # 1080/32=33.75、720/32=22.5 → SamplerCustomAdvanced 直接 RuntimeError。
+        # 与原生 /api/v1/generate 一致，先套用 adapt_canvas_size 对齐到兼容画布。
+        w, h = adapt_canvas_size(w, h)
 
     duration = float(body.get("duration", 5.0))
     duration = max(1.0, min(duration, MAX_DURATION))
     seed = int(body.get("seed", 0))
     steps = int(body.get("steps", DEFAULT_STEPS))
+    voiceover = body.get("voiceover")
+    voice = body.get("voice")
+    if not isinstance(voiceover, str) or not voiceover.strip():
+        voiceover = None
+    if not isinstance(voice, str):
+        voice = None
+    no_audio = bool(body.get("no_audio", False))
+    bgm = body.get("bgm")
+    if not isinstance(bgm, str) or not bgm.strip():
+        bgm = None
+    try:
+        bgm_volume = float(body.get("bgm_volume", 0.3))
+    except (TypeError, ValueError):
+        bgm_volume = 0.3
+    bgm_volume = max(0.0, min(1.0, bgm_volume))
 
-    prompt_graph = build_prompt(prompt, w, h, duration, seed, steps)
-    task_id = str(uuid.uuid4())
-    async with _submit_lock:
-        idx = await _pick_worker()
-        payload = {"prompt": prompt_graph, "client_id": "api-wrapper", "prompt_id": task_id}
-        async with _workers[idx].post(f"{_worker_url(idx)}/prompt", json=payload) as resp:
-            resp_body = await resp.json()
-            if resp.status != 200:
-                raise HTTPException(status_code=502, detail=resp_body)
-    _worker_assign[task_id] = idx
-    return {"id": resp_body.get("prompt_id", task_id), "status": "queued"}
+    if refs:
+        # 故事版整片 prompt 用 @ImageN / @图片N 引用参考图（Seedance 风格），ref2va
+        # 的引用语法是 <Picture N>——按参考图顺序原位重写，让身份锚定真正生效
+        prompt = re.sub(r"@(?:Image|图片)(\d+)",
+                        lambda m: f"<Picture {int(m.group(1))}>", prompt)
+        # 身份保真优先：默认按 2048px 短边高保真编码参考图（更贴近定妆照，但慢数倍）；
+        # 客户端可传 "match"（按生成画布像素面积等比缩放，更快）覆盖
+        ref_image_size = body.get("ref_image_size")
+        if ref_image_size not in ("match", "max"):
+            ref_image_size = "max"
+        task_id, _ = await _submit_ref2v_job(prompt, w, h, duration, seed, steps, refs,
+                                             ref_image_size, voiceover, voice, no_audio,
+                                             bgm, bgm_volume)
+    else:
+        task_id, _ = await _submit_job(prompt, w, h, duration, seed, steps,
+                                       first_frame, last_frame, voiceover, voice, no_audio,
+                                       bgm, bgm_volume)
+    return {"id": task_id, "status": "queued"}
 
 
 @app.get("/videos/{task_id}")
@@ -322,7 +948,17 @@ async def openai_video_status(task_id: str, request: Request):
             host = request.headers.get("host", "localhost:8000")
             base = f"http://{host}"
             data = []
-            for f in video_files:
+            first = video_files[0]
+            _video_worker[first.get("filename")] = idx
+            # 后处理（口播混流 / 静音）：任务完成后只对第一个视频处理一次
+            mux_name = await _post_process(task_id, idx,
+                                           first.get("filename"),
+                                           first.get("subfolder", ""))
+            first_url = f"{base}/api/v1/video/{mux_name or first['filename']}"
+            if not mux_name and first.get("subfolder"):
+                first_url += f"?subfolder={first['subfolder']}"
+            data.append({"url": first_url})
+            for f in video_files[1:]:
                 _video_worker[f.get("filename")] = idx
                 url = f"{base}/api/v1/video/{f.get('filename')}"
                 if f.get("subfolder"):

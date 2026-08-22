@@ -6,17 +6,17 @@
 # 把任务分发给最空闲的 GPU。进程跑在 tmux 会话中，不受终端退出影响。
 # --fast autotune cublas_ops: 启用 cuDNN benchmark 与 cuBLAS，加速推理。
 
-COMFY_DIR=/home/ubuntu/comfy/ComfyUI
-VENV=/home/ubuntu/comfy/venv/bin/python
-API=/home/ubuntu/comfy/api_server.py
-LOG_DIR=/home/ubuntu/comfy/logs
+COMFY_DIR=/home/ubuntu/minmax/comfy/ComfyUI
+VENV=/home/ubuntu/minmax/comfy/venv/bin/python
+API=/home/ubuntu/minmax/comfy/api_server.py
+LOG_DIR=/home/ubuntu/minmax/comfy/logs
 SESSION=comfy-multi
 API_PORT=8000
 W0_PORT=8188
 W1_PORT=8189
-# worker 1 使用独立输出/用户目录，避免两实例的文件计数器与 comfyui.db 冲突
-OUT_DIR=/home/ubuntu/comfy/ComfyUI/output
-USER_DIR=/home/ubuntu/comfy/ComfyUI/user
+# worker 1 使用独立输出/用户/数据库目录，避免两实例的文件计数器与 comfyui.db 冲突
+OUT_DIR=/home/ubuntu/minmax/comfy/ComfyUI/output
+USER_DIR=/home/ubuntu/minmax/comfy/ComfyUI/user
 FAST="--fast autotune cublas_ops"
 
 start() {
@@ -28,7 +28,7 @@ start() {
         "env -u LD_LIBRARY_PATH $VENV $COMFY_DIR/main.py --listen 0.0.0.0 --port $W0_PORT --cuda-device 0 $FAST 2>&1 | tee $LOG_DIR/comfy_gpu0.log" Enter
     # worker 1 (GPU 1)
     tmux new-window -t "$SESSION" \
-        "env -u LD_LIBRARY_PATH $VENV $COMFY_DIR/main.py --listen 0.0.0.0 --port $W1_PORT --cuda-device 1 --output-directory $OUT_DIR/gpu1 --user-directory $USER_DIR/gpu1 $FAST 2>&1 | tee $LOG_DIR/comfy_gpu1.log"
+        "env -u LD_LIBRARY_PATH $VENV $COMFY_DIR/main.py --listen 0.0.0.0 --port $W1_PORT --cuda-device 1 --output-directory $OUT_DIR/gpu1 --user-directory $USER_DIR/gpu1 --database-url sqlite:////home/ubuntu/minmax/comfy/ComfyUI/user/gpu1/comfyui.db $FAST 2>&1 | tee $LOG_DIR/comfy_gpu1.log"
     # API
     tmux new-window -t "$SESSION" \
         "env -u LD_LIBRARY_PATH COMFY_HOSTS=127.0.0.1:$W0_PORT,127.0.0.1:$W1_PORT $VENV $API 2>&1 | tee $LOG_DIR/api.log"

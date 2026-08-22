@@ -1,0 +1,51 @@
+---
+description: openclaw_hub 项目 GitHub 提交规范
+alwaysApply: true
+---
+
+# GitHub 提交规范
+
+## 项目配置
+
+- 仓库地址: https://github.com/sgerpguochao/comfy.git
+- 用户名: sgerpguochao
+- 默认分支: main
+
+## 提交前检查
+
+1. 运行相关测试，确保无回归
+2. 检查 `.gitignore`，避免提交敏感文件
+3. 提交信息遵循 [Conventional Commits](https://www.conventionalcommits.org/)
+
+## 提交信息格式
+
+使用以下前缀:
+
+| 类型 | 说明 |
+|------|------|
+| `feat:` | 新功能 |
+| `fix:` | Bug 修复 |
+| `docs:` | 文档更新 |
+| `style:` | 代码格式 |
+| `refactor:` | 代码重构 |
+| `perf:` | 性能优化 |
+| `test:` | 测试相关 |
+| `chore:` | 构建/工具 |
+
+### 示例
+
+```bash
+# Good
+git commit -m "feat: 添加自然语言查询功能"
+git commit -m "fix: 修复数据库连接超时问题"
+git commit -m "docs: 更新API文档"
+
+# Bad
+git commit -m "更新代码"
+git commit -m "fix bug"
+```
+
+## 安全提示
+
+- 使用环境变量 `GITHUB_TOKEN` 而非硬编码 token
+- 确保 `.env`、`*_token*` 等已加入 `.gitignore`

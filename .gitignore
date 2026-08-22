@@ -1,0 +1,48 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# ---- Virtual environments / packaged deps ----
+venv/
+.venv/
+env/
+wheels/
+
+# ---- ComfyUI upstream (separate repo, NOT vendored here) ----
+# ComfyUI/ is the upstream snapshot from https://github.com/comfyanonymous/ComfyUI
+# and remains its own git checkout. It is intentionally NOT committed here.
+# See README.md for setup instructions.
+ComfyUI/
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Editor / IDE (personal) ----
+.vscode/
+.idea/
+
+# ---- Secrets / tokens (per commit rules) ----
+.env
+.env.*
+*token*
+*secret*
+*_key.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Crash dumps ----
+core.*
+*.core
+
+# ---- Make placeholder dirs visible ----
+!logs/.gitkeep

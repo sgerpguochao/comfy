@@ -9,7 +9,8 @@
 #
 # 实际配置见 ecosystem.config.cjs；本脚本只是 PM2 的便捷包装。
 
-ECOSYSTEM=/home/ubuntu/comfy/ecosystem.config.cjs
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ECOSYSTEM="$SCRIPT_DIR/ecosystem.config.cjs"
 API_PORT=8000
 
 start() {
@@ -29,7 +30,7 @@ start() {
 
 stop() {
     # 复用 stop_services.sh 的逻辑（PM2 + tmux 兜底）
-    bash /home/ubuntu/comfy/stop_services.sh
+    bash "$SCRIPT_DIR/stop_services.sh" "$@"
 }
 
 restart() {
@@ -53,7 +54,7 @@ logs() {
 
 case "$1" in
     start)   start ;;
-    stop)    stop ;;
+    stop)    shift; stop "$@" ;;
     restart) restart ;;
     status)  status ;;
     logs)    shift; logs "$@" ;;

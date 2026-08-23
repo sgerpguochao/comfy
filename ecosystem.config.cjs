@@ -11,8 +11,8 @@ if (fs.existsSync(envFile)) {
   }
 }
 
-const VENV = "/home/ubuntu/comfy/venv/bin/python";
-const COMFY_DIR = "/home/ubuntu/comfy/ComfyUI";
+const VENV = "/home/ubuntu/minmax/comfy/venv/bin/python";
+const COMFY_DIR = "/home/ubuntu/minmax/comfy/ComfyUI";
 const FAST = "--fast autotune cublas_ops";
 
 module.exports = {
@@ -34,7 +34,7 @@ module.exports = {
     {
       name: "comfy-gpu1",
       script: `${COMFY_DIR}/main.py`,
-      args: `--listen 0.0.0.0 --port 8189 --cuda-device 1 --output-directory ${COMFY_DIR}/output/gpu1 --user-directory ${COMFY_DIR}/user/gpu1 ${FAST}`,
+      args: `--listen 0.0.0.0 --port 8189 --cuda-device 1 --output-directory ${COMFY_DIR}/output/gpu1 --user-directory ${COMFY_DIR}/user/gpu1 --database-url sqlite:////home/ubuntu/minmax/comfy/ComfyUI/user/gpu1/comfyui.db ${FAST}`,
       interpreter: VENV,
       cwd: COMFY_DIR,
       autorestart: true,

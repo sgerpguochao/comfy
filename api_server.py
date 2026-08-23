@@ -246,6 +246,7 @@ _muxed = {}           # 混流后文件名 -> 本地路径
 _vo_done = set()      # 后处理已终结的 task_id（成功或 ffmpeg 失败；源文件缺失不记入）
 _post_enqueued = set()  # 已入后台队列、避免每次轮询重复 put
 _post_failed = set()    # ffmpeg 已失败，不再重试
+_task_submit_errors = {}  # task_id -> 后台入队失败原因（POST /videos 秒回后异步提交）
 
 # 启动预热：异步提交 1 个 dummy 任务把模型加载到显存，避免业务任务摊 7.5 分钟冷启
 _warmed_workers: set = set()       # 已完成 warmup 的 worker 索引
@@ -504,8 +505,10 @@ async def _submit_job(prompt: str, width: Optional[int], height: Optional[int],
                       voice: Optional[str] = None,
                       no_audio: bool = False,
                       bgm: Optional[str] = None,
-                      bgm_volume: float = 0.3) -> tuple:
+                      bgm_volume: float = 0.3,
+                      task_id: Optional[str] = None) -> tuple:
     """选择 worker、读取/上传首尾帧、提交图生/文生任务，返回 (task_id, worker_idx)。
+    传入 task_id 时复用（OpenAI /videos 秒回路径先发 id 再后台入队）。
 
     first_frame/last_frame 支持四种引用：http(s) URL、data: URI、
     /api/v1/upload 返回的裸文件名、服务器本地图片路径（绝对或 input 相对）。
@@ -520,7 +523,7 @@ async def _submit_job(prompt: str, width: Optional[int], height: Optional[int],
     if width is None or height is None:
         width, height = 1344, 768
 
-    task_id = str(uuid.uuid4())
+    task_id = task_id or str(uuid.uuid4())
     if voiceover:
         _task_voiceover[task_id] = (voiceover, voice or VOICE_DEFAULT)
     if no_audio:
@@ -561,8 +564,10 @@ async def _submit_ref2v_job(prompt: str, width: Optional[int], height: Optional[
                             voice: Optional[str] = None,
                             no_audio: bool = False,
                             bgm: Optional[str] = None,
-                            bgm_volume: float = 0.3) -> tuple:
+                            bgm_volume: float = 0.3,
+                            task_id: Optional[str] = None) -> tuple:
     """上传参考图并提交 ref2va 任务，返回 (task_id, worker_idx)。
+    传入 task_id 时复用（OpenAI /videos 秒回路径）。
 
     ref_images 支持与 first_frame/last_frame 相同的四种引用（http(s) URL、data: URI、
     /api/v1/upload 返回的裸文件名、服务器本地路径），节点上限 9 张：保留前 9 张
@@ -583,7 +588,7 @@ async def _submit_ref2v_job(prompt: str, width: Optional[int], height: Optional[
     if width is None or height is None:
         width, height = 1344, 768
 
-    task_id = str(uuid.uuid4())
+    task_id = task_id or str(uuid.uuid4())
     if voiceover:
         _task_voiceover[task_id] = (voiceover, voice or VOICE_DEFAULT)
     if no_audio:
@@ -1130,6 +1135,7 @@ async def openai_video_generate(request: Request):
         bgm_volume = 0.3
     bgm_volume = max(0.0, min(1.0, bgm_volume))
 
+    task_id = str(uuid.uuid4())
     if refs:
         # 故事版整片 prompt 用 @ImageN / @图片N 引用参考图（Seedance 风格），ref2va
         # 的引用语法是 <Picture N>——按参考图顺序原位重写，让身份锚定真正生效
@@ -1140,13 +1146,25 @@ async def openai_video_generate(request: Request):
         ref_image_size = body.get("ref_image_size")
         if ref_image_size not in ("match", "max"):
             ref_image_size = "max"
-        task_id, _ = await _submit_ref2v_job(prompt, w, h, duration, seed, steps, refs,
-                                             ref_image_size, voiceover, voice, no_audio,
-                                             bgm, bgm_volume)
+        coro = _submit_ref2v_job(prompt, w, h, duration, seed, steps, refs,
+                                 ref_image_size, voiceover, voice, no_audio,
+                                 bgm, bgm_volume, task_id=task_id)
     else:
-        task_id, _ = await _submit_job(prompt, w, h, duration, seed, steps,
-                                       first_frame, last_frame, voiceover, voice, no_audio,
-                                       bgm, bgm_volume)
+        coro = _submit_job(prompt, w, h, duration, seed, steps,
+                           first_frame, last_frame, voiceover, voice, no_audio,
+                           bgm, bgm_volume, task_id=task_id)
+
+    async def _bg_submit(tid, c):
+        try:
+            await c
+        except Exception as e:
+            detail = getattr(e, "detail", None)
+            _task_submit_errors[tid] = str(detail if detail is not None else e)
+            print(f"[openai /videos] background submit failed {tid}: {_task_submit_errors[tid]}")
+
+    # 2026-08-23：秒回 task id，上传首帧 / ComfyUI 入队放到后台。
+    # 否则 GPU 忙时 POST 卡超过 OpenClaw 单次 HTTP 120s，客户端放弃、片还在跑。
+    asyncio.create_task(_bg_submit(task_id, coro))
     # OpenAI 兼容补丁：回显档位信息（秒数 + 帧数），便于客户端/冒烟核对
     # 档位重映射是否生效（seconds 4 → duration 5 → 124 帧 @24fps）。
     return {"id": task_id, "status": "queued",
@@ -1158,6 +1176,9 @@ async def openai_video_generate(request: Request):
 @app.get("/videos/{task_id}")
 async def openai_video_status(task_id: str, request: Request):
     """OpenAI 兼容的任务状态查询。"""
+    if task_id in _task_submit_errors:
+        return {"id": task_id, "status": "failed",
+                "error": {"message": _task_submit_errors[task_id]}}
     idx = _worker_assign.get(task_id, 0)
     try:
         async with _workers[idx].get(f"{_worker_url(idx)}/history/{task_id}") as resp:

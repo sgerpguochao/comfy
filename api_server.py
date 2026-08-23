@@ -45,7 +45,7 @@ AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 
 DEFAULT_STEPS = 10  # 10 步为速度/质量折中（20 步约慢 1.7 倍）
 DEFAULT_FPS = 24
-MAX_DURATION = 10  # 模型训练区间 ~5-15s；本地实测 10s 不 OOM（显存 98.2%），与 generate_h3 的 --duration 上限保持一致
+MAX_DURATION = 5  # 2026-08-23 lock: CF hard standard 5s; >5s requests are clamped (max(1, min(x, MAX_DURATION)))
 
 # 口播（edge-tts + ffmpeg 混流）
 VOICE_DEFAULT = "zh-CN-XiaoxiaoNeural"  # 默认音色（女声，新闻/小说）
@@ -1097,11 +1097,10 @@ async def openai_video_generate(request: Request):
         # 与原生 /api/v1/generate 一致，先套用 adapt_canvas_size 对齐到兼容画布。
         w, h = adapt_canvas_size(w, h)
 
-    # OpenAI 兼容补丁：适配器发 seconds（档位 4/8/12，客户端 durationSeconds 已被
-    # 舍入——传 1~6.4 发 4，6.5~10.4 发 8，>=10.5 发 12）。本工作区标准 5s、
-    # 上限 10s，故做档位重映射：4→5（标准）、8→8、12→10（clamp 到 MAX_DURATION）。
-    # duration 字段直传时按原值处理（仍受 clamp 保护），仅 OpenAI 档位值走映射表。
-    OPENAI_SECONDS_REMAP = {4: 5.0, 8: 8.0, 12: 10.0}
+    # OpenAI 兼容补丁：适配器发 seconds（OpenAI 档位 4/8/12）。
+    # 2026-08-23 lock：标准时长硬锁 5s（MAX_DURATION=5）；任何 OpenAI 档位值（4/8/12）
+    # 以及任何 duration 字段（<=MAX_DURATION）一律映射为 5s。
+    OPENAI_SECONDS_REMAP = {4: 5.0, 8: 5.0, 12: 5.0}  # 2026-08-23 lock: any OpenAI slot (4/8/12) remaps to 5s standard
     raw_duration = body.get("duration", body.get("seconds", 5.0))
     try:
         duration = float(raw_duration)

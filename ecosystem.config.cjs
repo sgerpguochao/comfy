@@ -31,19 +31,21 @@ module.exports = {
         LD_LIBRARY_PATH: "",
       },
     },
-    {
-      name: "comfy-gpu1",
-      script: `${COMFY_DIR}/main.py`,
-      args: `--listen 0.0.0.0 --port 8189 --cuda-device 1 --output-directory ${COMFY_DIR}/output/gpu1 --user-directory ${COMFY_DIR}/user/gpu1 --database-url sqlite:////home/ubuntu/minmax/comfy/ComfyUI/user/gpu1/comfyui.db ${FAST}`,
-      interpreter: VENV,
-      cwd: COMFY_DIR,
-      autorestart: true,
-      max_restarts: 5,
-      env: {
-        ...env,
-        LD_LIBRARY_PATH: "",
-      },
-    },
+    // GPU1 worker temporarily disabled: GSP firmware deadlock (Xid 175 → progress 0x3)
+    // To re-enable after physical reset, uncomment this block AND restore COMFY_HOSTS below.
+    // {
+    //   name: "comfy-gpu1",
+    //   script: `${COMFY_DIR}/main.py`,
+    //   args: `--listen 0.0.0.0 --port 8189 --cuda-device 1 --output-directory ${COMFY_DIR}/output/gpu1 --user-directory ${COMFY_DIR}/user/gpu1 --database-url sqlite:////home/ubuntu/minmax/comfy/ComfyUI/user/gpu1/comfyui.db ${FAST}`,
+    //   interpreter: VENV,
+    //   cwd: COMFY_DIR,
+    //   autorestart: true,
+    //   max_restarts: 5,
+    //   env: {
+    //     ...env,
+    //     LD_LIBRARY_PATH: "",
+    //   },
+    // },
     {
       name: "minimax-h3-api",
       script: "api_server.py",
@@ -53,7 +55,8 @@ module.exports = {
       max_restarts: 5,
       env: {
         ...env,
-        COMFY_HOSTS: "127.0.0.1:8188,127.0.0.1:8189",
+        // GPU1 temporarily disabled; restore "127.0.0.1:8188,127.0.0.1:8189" after physical reset
+        COMFY_HOSTS: "127.0.0.1:8188",
         LD_LIBRARY_PATH: "",
       },
     },

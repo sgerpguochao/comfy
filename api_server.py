@@ -1055,6 +1055,17 @@ async def openai_video_generate(request: Request):
     if not isinstance(last_frame, str):
         last_frame = None
 
+    # OpenAI 兼容补丁：openai 适配器图生视频发 input_reference.image_url（值是
+    # data URI 字符串；也接受 {url: "..."} 对象风格）。_fetch_frame_bytes 原生
+    # 支持 http(s) URL / data URI，这里只做字段搬运，不重复校验。
+    input_ref = body.get("input_reference")
+    if isinstance(input_ref, dict):
+        ref_url = input_ref.get("image_url")
+        if isinstance(ref_url, dict):
+            ref_url = ref_url.get("url")
+        if isinstance(ref_url, str) and ref_url.strip() and not first_frame:
+            first_frame = ref_url.strip()
+
     # 多参考图（ref2va 路径）：定妆照 + 各分镜关键帧作为人物/商品身份锚点。
     # 与 input 不同，它们不是首尾帧，而是全程参与 conditioning（<Picture N> 引用）。
     reference_images = body.get("reference_images") or body.get("referenceImageUrls")
@@ -1068,6 +1079,17 @@ async def openai_video_generate(request: Request):
         w, h = int(body["width"]), int(body["height"])
     elif body.get("resolution") and body["resolution"] in RESOLUTION_MAP:
         w, h = RESOLUTION_MAP[body["resolution"]]
+    # OpenAI 兼容补丁：适配器发 sora 白名单 size（"720x1280"/"1280x720"/
+    # "1024x1792"/"1792x1024"）。解析出 w/h 后交给下方 adapt_canvas_size 对齐 32
+    # 倍数（H3 latent 硬约束：720/32=22.5 不可整除，直接用会 RuntimeError）。
+    size_str = body.get("size")
+    if (isinstance(size_str, str) and "x" in size_str.lower()
+            and not (body.get("width") and body.get("height"))):
+        try:
+            sw, sh = size_str.lower().split("x", 1)
+            w, h = int(sw), int(sh)
+        except ValueError:
+            pass
     if w and h:
         # H3 的 latent 要求画布尺寸能被 32 整除（patchify 按 patch 2 切分），而标准
         # 1080p/720p/480p（1920x1080 / 1280x720 / 854x480）在短边都不满足：
@@ -1075,7 +1097,18 @@ async def openai_video_generate(request: Request):
         # 与原生 /api/v1/generate 一致，先套用 adapt_canvas_size 对齐到兼容画布。
         w, h = adapt_canvas_size(w, h)
 
-    duration = float(body.get("duration", 5.0))
+    # OpenAI 兼容补丁：适配器发 seconds（档位 4/8/12，客户端 durationSeconds 已被
+    # 舍入——传 1~6.4 发 4，6.5~10.4 发 8，>=10.5 发 12）。本工作区标准 5s、
+    # 上限 10s，故做档位重映射：4→5（标准）、8→8、12→10（clamp 到 MAX_DURATION）。
+    # duration 字段直传时按原值处理（仍受 clamp 保护），仅 OpenAI 档位值走映射表。
+    OPENAI_SECONDS_REMAP = {4: 5.0, 8: 8.0, 12: 10.0}
+    raw_duration = body.get("duration", body.get("seconds", 5.0))
+    try:
+        duration = float(raw_duration)
+    except (TypeError, ValueError):
+        duration = 5.0
+    if "duration" not in body and duration in OPENAI_SECONDS_REMAP:
+        duration = OPENAI_SECONDS_REMAP[duration]
     duration = max(1.0, min(duration, MAX_DURATION))
     seed = int(body.get("seed", 0))
     steps = int(body.get("steps", DEFAULT_STEPS))
@@ -1085,7 +1118,10 @@ async def openai_video_generate(request: Request):
         voiceover = None
     if not isinstance(voice, str):
         voice = None
-    no_audio = bool(body.get("no_audio", False))
+    # OpenAI 兼容补丁：/videos 端点默认静音——CF 流水线（faceless 等 skill）配音/
+    # BGM 全在后期自己做，H3 原生音效混进去是噪音。要原声显式传 no_audio: false。
+    # 仅改本端点默认值，/api/v1/generate 原生入口保持 no_audio 默认 False 不变。
+    no_audio = bool(body.get("no_audio", True))
     bgm = body.get("bgm")
     if not isinstance(bgm, str) or not bgm.strip():
         bgm = None
@@ -1112,7 +1148,12 @@ async def openai_video_generate(request: Request):
         task_id, _ = await _submit_job(prompt, w, h, duration, seed, steps,
                                        first_frame, last_frame, voiceover, voice, no_audio,
                                        bgm, bgm_volume)
-    return {"id": task_id, "status": "queued"}
+    # OpenAI 兼容补丁：回显档位信息（秒数 + 帧数），便于客户端/冒烟核对
+    # 档位重映射是否生效（seconds 4 → duration 5 → 124 帧 @24fps）。
+    return {"id": task_id, "status": "queued",
+            "duration": duration,
+            "seconds": body.get("seconds"),
+            "frame_count": frame_count_for_duration(duration)}
 
 
 @app.get("/videos/{task_id}")
@@ -1139,8 +1180,10 @@ async def openai_video_status(task_id: str, request: Request):
             if phase == "processing":
                 return {"id": task_id, "status": "processing"}
             if phase == "error":
+                # OpenAI 兼容：error 用 {message} 对象结构，openai 适配器读
+                # error.message 才能拿到失败明细（纯字符串会显示通用文案）
                 return {"id": task_id, "status": "failed",
-                        "error": extra.get("error", "audio post-process failed")}
+                        "error": {"message": extra.get("error", "audio post-process failed")}}
             result = {"id": task_id, "status": "completed"}
             if extra.get("videos"):
                 result["data"] = [{"url": u} for u in extra["videos"]]
@@ -1155,7 +1198,7 @@ async def openai_video_status(task_id: str, request: Request):
             if isinstance(msg, list) and len(msg) == 2 and isinstance(msg[1], dict):
                 if msg[0] == "execution_error":
                     return {"id": task_id, "status": "failed",
-                            "error": msg[1].get("message", str(msg[1]))}
+                            "error": {"message": msg[1].get("message", str(msg[1]))}}
 
     # ComfyUI 中任务存在但未完成 -> 仍在处理
     return {"id": task_id, "status": "processing"}
